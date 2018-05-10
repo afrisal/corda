@@ -1,9 +1,11 @@
 package net.corda.client.jackson
 
 import com.fasterxml.jackson.annotation.JsonIgnore
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.core.*
 import com.fasterxml.jackson.databind.*
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize
 import com.fasterxml.jackson.databind.deser.std.NumberDeserializers
 import com.fasterxml.jackson.databind.deser.std.StdDeserializer
 import com.fasterxml.jackson.databind.module.SimpleModule
@@ -16,6 +18,7 @@ import net.corda.client.jackson.internal.addSerAndDeser
 import net.corda.client.jackson.internal.jsonObject
 import net.corda.client.jackson.internal.readValueAs
 import net.corda.core.CordaInternal
+import net.corda.core.CordaOID
 import net.corda.core.DoNotImplement
 import net.corda.core.contracts.Amount
 import net.corda.core.contracts.ContractState
@@ -23,24 +26,29 @@ import net.corda.core.contracts.StateRef
 import net.corda.core.crypto.*
 import net.corda.core.crypto.TransactionSignature
 import net.corda.core.identity.*
+import net.corda.core.internal.CertRole
 import net.corda.core.internal.VisibleForTesting
 import net.corda.core.internal.uncheckedCast
 import net.corda.core.messaging.CordaRPCOps
 import net.corda.core.node.NodeInfo
 import net.corda.core.node.services.IdentityService
 import net.corda.core.serialization.SerializedBytes
+import net.corda.core.serialization.deserialize
 import net.corda.core.serialization.serialize
 import net.corda.core.transactions.CoreTransaction
 import net.corda.core.transactions.NotaryChangeWireTransaction
 import net.corda.core.transactions.SignedTransaction
 import net.corda.core.transactions.WireTransaction
-import net.corda.core.utilities.NetworkHostAndPort
-import net.corda.core.utilities.OpaqueBytes
-import net.corda.core.utilities.parsePublicKeyBase58
-import net.corda.core.utilities.toBase58String
+import net.corda.core.utilities.*
+import org.bouncycastle.asn1.x509.KeyPurposeId
+import java.lang.reflect.Modifier
 import java.math.BigDecimal
 import java.security.PublicKey
+import java.security.cert.CertPath
+import java.security.cert.CertificateFactory
+import java.security.cert.X509Certificate
 import java.util.*
+import javax.security.auth.x500.X500Principal
 
 /**
  * Utilities and serialisers for working with JSON representations of basic types. This adds Jackson support for
@@ -96,19 +104,22 @@ object JacksonSupport {
             addSerAndDeser<BigDecimal>(toStringSerializer, NumberDeserializers.BigDecimalDeserializer())
             addSerAndDeser<SecureHash.SHA256>(toStringSerializer, SecureHashDeserializer())
             addSerAndDeser(toStringSerializer, AmountDeserializer)
-            addSerAndDeser(OpaqueBytesSerializer, OpaqueBytesDeserializer)
+            addSerAndDeser(ByteSequenceSerializer, ByteSequenceDeserializer)
+            addDeserializer(OpaqueBytes::class.java, OpaqueBytesDeserializer)
+            addSerAndDeser(SerializedBytesSerializer, SerializedBytesDeserializer)
             addSerAndDeser(toStringSerializer, CordaX500NameDeserializer)
             addSerAndDeser(PublicKeySerializer, PublicKeyDeserializer)
             addDeserializer(CompositeKey::class.java, CompositeKeyDeseriaizer)
             addSerAndDeser(toStringSerializer, NetworkHostAndPortDeserializer)
-            // TODO Add deserialization which follows the same lookup logic as Party
-            addSerializer(PartyAndCertificate::class.java, PartyAndCertificateSerializer)
-            addDeserializer(NodeInfo::class.java, NodeInfoDeserializer)
+            addSerializer(PartyAndCertificateSerializer)  // TODO Add deserialization which follows the same lookup logic as Party
+            addSerAndDeser(X509CertificateSerializer, X509CertificateDeserializer())
+            addSerializer(X500Principal::class.java, toStringSerializer)
 
             listOf(TransactionSignatureSerde, SignedTransactionSerde).forEach { serde -> serde.applyTo(this) }
 
             // Using mixins to fine-tune the default serialised output
             setMixInAnnotation(WireTransaction::class.java, WireTransactionMixin::class.java)
+            setMixInAnnotation(CertPath::class.java, CertPathMixin::class.java)
             setMixInAnnotation(NodeInfo::class.java, NodeInfoMixin::class.java)
         }
     }
@@ -200,12 +211,121 @@ object JacksonSupport {
                 // TODO Add configurable option to output the certPath
             }
         }
+        override fun handledType(): Class<PartyAndCertificate> = PartyAndCertificate::class.java
     }
 
-    @Suppress("unused")
-    private interface NodeInfoMixin {
-        @get:JsonIgnore val legalIdentities: Any  // This is already covered by legalIdentitiesAndCerts
+    private object ByteSequenceSerializer : JsonSerializer<ByteSequence>() {
+        override fun serialize(value: ByteSequence, gen: JsonGenerator, serializers: SerializerProvider) {
+            gen.writeBinary(value.bytes, value.offset, value.size)
+        }
     }
+
+    private object ByteSequenceDeserializer : JsonDeserializer<ByteSequence>() {
+        override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): ByteSequence {
+            return OpaqueBytes(parser.binaryValue)
+        }
+    }
+
+    private object SerializedBytesSerializer : JsonSerializer<SerializedBytes<*>>() {
+        override fun serialize(value: SerializedBytes<*>, gen: JsonGenerator, serializers: SerializerProvider) {
+            val deserialized = value.deserialize<Any>()
+            gen.jsonObject {
+                writeStringField("class", deserialized.javaClass.name)
+                writeObjectField("deserialized", deserialized)
+            }
+        }
+    }
+
+    private object SerializedBytesDeserializer : JsonDeserializer<SerializedBytes<*>>() {
+        override fun deserialize(parser: JsonParser, context: DeserializationContext): SerializedBytes<Any> {
+            return if (parser.currentToken == JsonToken.START_OBJECT) {
+                val mapper = parser.codec as ObjectMapper
+                val json = parser.readValueAsTree<ObjectNode>()
+                val clazz = context.findClass(json["class"].textValue())
+                val pojo = mapper.convertValue(json["deserialized"], clazz)
+                pojo.serialize()
+            } else {
+                SerializedBytes(parser.binaryValue)
+            }
+        }
+    }
+
+
+    private object X509CertificateSerializer : JsonSerializer<X509Certificate>() {
+        val keyUsages = arrayOf(
+                "digitalSignature",
+                "nonRepudiation",
+                "keyEncipherment",
+                "dataEncipherment",
+                "keyAgreement",
+                "keyCertSign",
+                "cRLSign",
+                "encipherOnly",
+                "decipherOnly"
+        )
+
+        val keyPurposeIds = KeyPurposeId::class.java
+                .fields
+                .filter { Modifier.isStatic(it.modifiers) && it.type == KeyPurposeId::class.java }
+                .associateBy({ (it.get(null) as KeyPurposeId).id }, { it.name })
+
+        val knownExtensions = setOf("2.5.29.15", "2.5.29.37", "2.5.29.19", "2.5.29.17", "2.5.29.18", CordaOID.X509_EXTENSION_CORDA_ROLE)
+
+        override fun serialize(value: X509Certificate, gen: JsonGenerator, serializers: SerializerProvider) {
+            gen.jsonObject {
+                writeNumberField("version", value.version)
+                writeObjectField("serialNumber", value.serialNumber)
+                writeObjectField("subject", value.subjectX500Principal)
+                writeObjectField("publicKey", value.publicKey)
+                writeObjectField("issuer", value.issuerX500Principal)
+                writeObjectField("notBefore", value.notBefore)
+                writeObjectField("notAfter", value.notAfter)
+                writeObjectField("issuerUniqueID", value.issuerUniqueID)
+                writeObjectField("subjectUniqueID", value.subjectUniqueID)
+                writeObjectField("keyUsage", value.keyUsage?.asList()?.mapIndexedNotNull { i, flag -> if (flag) keyUsages[i] else null })
+                writeObjectField("extendedKeyUsage", value.extendedKeyUsage.map { keyPurposeIds.getOrDefault(it, it) })
+                jsonObject("basicConstraints") {
+                    writeBooleanField("isCA", value.basicConstraints != -1)
+                    writeObjectField("pathLength", value.basicConstraints.let { if (it != Int.MAX_VALUE) it else null })
+                }
+                writeObjectField("subjectAlternativeNames", value.subjectAlternativeNames)
+                writeObjectField("issuerAlternativeNames", value.issuerAlternativeNames)
+                writeObjectField("cordaCertRole", CertRole.extract(value))
+                writeObjectField("otherCriticalExtensions", value.criticalExtensionOIDs - knownExtensions)
+                writeObjectField("otherNonCriticalExtensions", value.nonCriticalExtensionOIDs - knownExtensions)
+                writeBinaryField("encoded", value.encoded)
+            }
+        }
+
+        override fun handledType(): Class<X509Certificate> = X509Certificate::class.java
+    }
+
+    private class X509CertificateDeserializer : JsonDeserializer<X509Certificate>() {
+        private val certFactory = CertificateFactory.getInstance("X.509")
+        override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): X509Certificate {
+            val encoded = parser.readValueAsTree<ObjectNode>()["encoded"]
+            return certFactory.generateCertificate(encoded.binaryValue().inputStream()) as X509Certificate
+        }
+    }
+
+    private class CertPathDeserializer : JsonDeserializer<CertPath>() {
+        private val certFactory = CertificateFactory.getInstance("X.509")
+        override fun deserialize(parser: JsonParser, ctxt: DeserializationContext): CertPath {
+            val mapper = parser.codec as ObjectMapper
+            val json = parser.readValueAsTree<ObjectNode>()
+            require(json["type"].textValue() == "X.509") { "Only X.509 cert paths are supported" }
+            val certificates = json["certificates"].elements().asSequence().map { mapper.convertValue<X509Certificate>(it) }.toList()
+            return certFactory.generateCertPath(certificates)
+        }
+    }
+
+    @JsonIgnoreProperties("encodings", "encoded")
+    @JsonDeserialize(using = CertPathDeserializer::class)
+    private interface CertPathMixin
+
+    @JsonIgnoreProperties("legalIdentities")  // This is already covered by legalIdentitiesAndCerts
+    @JsonDeserialize(using = NodeInfoDeserializer::class)
+    private interface NodeInfoMixin
 
     private interface JsonSerde<TYPE> {
         val type: Class<TYPE>
@@ -467,7 +587,7 @@ object JacksonSupport {
     abstract class SignedTransactionMixin {
         @JsonIgnore abstract fun getTxBits(): SerializedBytes<CoreTransaction>
         @JsonProperty("signatures") protected abstract fun getSigs(): List<TransactionSignature>
-        @JsonProperty protected abstract fun getTransaction(): CoreTransaction  // TODO It seems this should be coreTransaction
+        @JsonProperty protected abstract fun getTransaction(): CoreTransaction
         @JsonIgnore abstract fun getTx(): WireTransaction
         @JsonIgnore abstract fun getNotaryChangeTx(): NotaryChangeWireTransaction
         @JsonIgnore abstract fun getInputs(): List<StateRef>
